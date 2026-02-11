@@ -36,6 +36,8 @@ class LightningTrainer(pl.LightningModule):
         use_collision_loss=True,
         use_contrast_loss=False,
         regulate_yaw=False,
+        use_prob_nll_loss=False,
+        nll_weight=0.1,
         objective_aggregate_mode: str = "mean",
     ) -> None:
         """
@@ -63,6 +65,8 @@ class LightningTrainer(pl.LightningModule):
         self.use_collision_loss = use_collision_loss
         self.use_contrast_loss = use_contrast_loss
         self.regulate_yaw = regulate_yaw
+        self.use_prob_nll_loss = use_prob_nll_loss
+        self.nll_weight = nll_weight
 
         self.radius = model.radius
         self.num_modes = model.num_modes
@@ -158,6 +162,18 @@ class LightningTrainer(pl.LightningModule):
             data, prediction, valid_mask[:, 1:], target[:, 1:]
         )
 
+        if self.use_prob_nll_loss and "prob_trajectory_sigma_xy" in res:
+            prob_nll_loss = self.get_probabilistic_nll_loss(
+                data=data,
+                trajectory_mu=res["prob_trajectory_mu"][:train_num],
+                sigma_xy=res["prob_trajectory_sigma_xy"][:train_num],
+                probability=probability,
+                valid_mask=valid_mask[:, 0],
+                target=target[:, 0],
+            )
+        else:
+            prob_nll_loss = prediction_loss.new_zeros(1)
+
         if self.training and self.use_contrast_loss:
             contrastive_loss = self._compute_contrastive_loss(
                 res["hidden"], data["data_n_valid_mask"]
@@ -172,6 +188,7 @@ class LightningTrainer(pl.LightningModule):
             + contrastive_loss
             + collision_loss
             + ego_ref_free_reg_loss
+            + self.nll_weight * prob_nll_loss
         )
 
         return {
@@ -182,7 +199,34 @@ class LightningTrainer(pl.LightningModule):
             "collision_loss": collision_loss.item(),
             "prediction_loss": prediction_loss.item(),
             "contrastive_loss": contrastive_loss.item(),
+            "prob_nll_loss": prob_nll_loss.item(),
         }
+
+    def get_probabilistic_nll_loss(
+        self,
+        data,
+        trajectory_mu: torch.Tensor,
+        sigma_xy: torch.Tensor,
+        probability: torch.Tensor,
+        valid_mask: torch.Tensor,
+        target: torch.Tensor,
+    ) -> torch.Tensor:
+        """Stage-1 uncertainty warm-up objective using selected mode and XY Gaussian NLL."""
+        bs, q, _, _ = trajectory_mu.shape
+        target_xy = target[..., :2]
+
+        target_xy_expand = target_xy.unsqueeze(1)
+        mode_distance = ((trajectory_mu[..., :2] - target_xy_expand).pow(2).sum(dim=(-1, -2)))
+        best_idx = mode_distance.argmin(dim=-1)
+
+        batch_index = torch.arange(bs, device=trajectory_mu.device)
+        mu_star = trajectory_mu[batch_index, best_idx, :, :2]
+        sigma_star = sigma_xy[batch_index, best_idx]
+
+        sigma2 = sigma_star.pow(2).clamp_min(1e-6)
+        nll = ((target_xy - mu_star).pow(2) / (2 * sigma2)) + sigma_star.log() + 0.5 * math.log(2 * math.pi)
+        nll = nll.sum(-1)
+        return (nll * valid_mask).sum() / valid_mask.sum().clamp_min(1)
 
     def get_prediction_loss(self, data, prediction, valid_mask, target):
         """

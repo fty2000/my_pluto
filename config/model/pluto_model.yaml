@@ -17,6 +17,9 @@ state_dropout: 0.75
 use_ego_history: false
 state_attn_encoder: true
 use_hidden_proj: false
+probabilistic_policy: false
+latent_dim: 8
+use_uncertainty_head: false
 
 feature_builder:
   _target_: src.feature_builders.pluto_feature_builder.PlutoFeatureBuilder

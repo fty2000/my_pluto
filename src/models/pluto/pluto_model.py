@@ -19,6 +19,7 @@ from .modules.map_encoder import MapEncoder
 from .modules.static_objects_encoder import StaticObjectsEncoder
 from .modules.planning_decoder import PlanningDecoder
 from .layers.mlp_layer import MLPLayer
+from .modules.probabilistic_heads import ProbTrajectoryHead, TrajUncertaintyHead
 
 # no meaning, required by nuplan
 trajectory_sampling = TrajectorySampling(num_poses=8, time_horizon=8, interval_length=1)
@@ -45,6 +46,9 @@ class PlanningModel(TorchModuleWrapper):
         use_hidden_proj=False,
         cat_x=False,
         ref_free_traj=False,
+        probabilistic_policy=False,
+        latent_dim=8,
+        use_uncertainty_head=False,
         feature_builder: PlutoFeatureBuilder = PlutoFeatureBuilder(),
     ) -> None:
         super().__init__(
@@ -60,6 +64,9 @@ class PlanningModel(TorchModuleWrapper):
         self.num_modes = num_modes
         self.radius = feature_builder.radius
         self.ref_free_traj = ref_free_traj
+        self.probabilistic_policy = probabilistic_policy
+        self.latent_dim = latent_dim
+        self.use_uncertainty_head = use_uncertainty_head
 
         self.pos_emb = FourierEmbedding(3, dim, 64)
 
@@ -107,6 +114,18 @@ class PlanningModel(TorchModuleWrapper):
 
         if self.ref_free_traj:
             self.ref_free_decoder = MLPLayer(dim, 2 * dim, future_steps * 4)
+
+        if self.probabilistic_policy:
+            self.prob_traj_head = ProbTrajectoryHead(
+                d_q=dim,
+                d_z=latent_dim,
+                future_steps=future_steps,
+                traj_dim=4,
+                hidden_dim=2 * dim,
+            )
+            self.log_std_z = nn.Parameter(torch.full((latent_dim,), math.log(0.1)))
+            if self.use_uncertainty_head:
+                self.uncertainty_head = TrajUncertaintyHead(d_q=dim, future_steps=future_steps)
 
         self.apply(self._init_weights)
 
@@ -163,17 +182,37 @@ class PlanningModel(TorchModuleWrapper):
         ref_line_available = data["reference_line"]["position"].shape[1] > 0
 
         if ref_line_available:
-            trajectory, probability = self.planning_decoder(
+            trajectory, probability, planning_query = self.planning_decoder(
                 data, {"enc_emb": x, "enc_key_padding_mask": key_padding_mask}
             )
         else:
-            trajectory, probability = None, None
+            trajectory, probability, planning_query = None, None, None
 
         out = {
             "trajectory": trajectory,
             "probability": probability,  # (bs, R, M)
             "prediction": prediction,  # (bs, A-1, T, 2)
         }
+
+        if planning_query is not None:
+            out["planning_query"] = planning_query
+
+        if self.probabilistic_policy and planning_query is not None:
+            bs, r_num, m_num, _ = planning_query.shape
+            flat_query = planning_query.reshape(bs, r_num * m_num, self.dim)
+            out["policy_logits"] = probability.reshape(bs, r_num * m_num)
+            out["policy_query"] = flat_query
+            out["log_std_z"] = self.log_std_z
+
+            z_zero = flat_query.new_zeros(bs * r_num * m_num, self.latent_dim)
+            mu = self.prob_traj_head(flat_query.reshape(-1, self.dim), z_zero)
+            out["prob_trajectory_mu"] = mu.reshape(bs, r_num * m_num, self.future_steps, 4)
+
+            if self.use_uncertainty_head:
+                sigma_xy = self.uncertainty_head(flat_query.reshape(-1, self.dim))
+                out["prob_trajectory_sigma_xy"] = sigma_xy.reshape(
+                    bs, r_num * m_num, self.future_steps, 2
+                )
 
         if self.use_hidden_proj:
             out["hidden"] = self.hidden_proj(x[:, 0])

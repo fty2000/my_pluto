@@ -117,6 +117,14 @@ sh ./script/run_pluto_planner.sh pluto_planner nuplan_mini mini_demo_scenario pl
 
 The rendered simulation video will be saved to the specified directory (need change `/dir_to_save_the_simulation_result_video`).
 
+
+## Probabilistic-PLUTO + VD-GRPO
+
+For Stage-1 probabilistic warm-up and Stage-2 RL fine-tuning, see:
+
+- `run_rl_training.py`
+- `docs/prob_pluto_vd_grpo_manual.md`
+
 ## To Do
 
 The code is under cleaning and will be released gradually.
