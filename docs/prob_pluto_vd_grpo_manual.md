@@ -177,13 +177,36 @@ rl.idm_headway=1.5
 
 ### 5.3 多卡/设备
 
-当前 `run_rl_training.py` 是单进程训练脚本。通过 `rl.device` 选择设备：
+当前 `run_rl_training.py` 已支持 DDP 多卡。
+
+#### 单卡
 
 ```bash
-rl.device=cuda
-# 或
-rl.device=cpu
+python run_rl_training.py ... rl.device=cuda
 ```
+
+#### 多卡（推荐 torchrun）
+
+```bash
+torchrun --nproc_per_node=4 run_rl_training.py \
+  +training=train_pluto \
+  scenario_builder=nuplan \
+  cache.cache_path=/nuplan/exp/cache_pluto_1M \
+  cache.use_cache_without_dataset=true \
+  checkpoint=/path/to/stage1.ckpt \
+  rl.device=cuda rl.epochs=5 rl.group_size=4
+```
+
+可选 DDP 参数：
+
+```bash
+rl.ddp_find_unused_parameters=false
+```
+
+说明：
+- 脚本会自动根据 `WORLD_SIZE/LOCAL_RANK` 初始化分布式并使用 `DistributedSampler`。
+- checkpoint 仅在 rank0 保存。
+- 训练/验证指标会做多卡均值聚合。
 
 ---
 
