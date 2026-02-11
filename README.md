@@ -98,6 +98,15 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 python run_training.py \
 - you can remove wandb related configurations if your prefer tensorboard.
 
 
+
+## Probabilistic-PLUTO + Continuous VD-GRPO
+
+This repo now includes a first implementation of probabilistic policy modeling, Stage-1 uncertainty warm-up, and Stage-2 VD-GRPO fine-tuning modules.
+
+- Design and operation manual: `docs/PROB_PLUTO_VD_GRPO_MANUAL.md`
+- Stage-1 config preset: `+training=train_prob_pluto_stage1`
+- Stage-2 launcher: `run_stage2_rl.py` (supports `torchrun` multi-GPU)
+
 ## Checkpoint
 
 Download and place the checkpoint in the `pluto/checkpoints` folder.
@@ -116,6 +125,13 @@ sh ./script/run_pluto_planner.sh pluto_planner nuplan_mini mini_demo_scenario pl
 ```
 
 The rendered simulation video will be saved to the specified directory (need change `/dir_to_save_the_simulation_result_video`).
+
+
+Run simulation for Stage-1/Stage-2 probabilistic checkpoints:
+
+```
+sh ./script/run_prob_pluto_planner.sh nuplan_mini mini_demo_scenario stage2_vd_grpo_policy.ckpt /dir_to_save_the_simulation_result_video
+```
 
 ## To Do
 
