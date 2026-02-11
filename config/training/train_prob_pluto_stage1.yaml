@@ -1,0 +1,12 @@
+defaults:
+  - override /model: probabilistic_pluto_model
+  - override /custom_trainer: prob_stage1_warmup_trainer
+  - override /scenario_filter: training_scenarios_1M
+  - override /splitter: nuplan
+
+objective_aggregate_mode: mean
+
+epochs: 25
+warmup_epochs: 3
+lr: 1e-3
+weight_decay: 1e-4
