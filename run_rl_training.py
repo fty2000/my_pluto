@@ -121,6 +121,14 @@ def _inject_rl_defaults(cfg: DictConfig) -> None:
         "idm_min_gap": 2.0,
         "idm_headway": 1.5,
         "ddp_find_unused_parameters": False,
+        "reward_w_progress": 1.0,
+        "reward_w_speed": 0.2,
+        "reward_w_comfort": 0.05,
+        "reward_w_margin": 0.3,
+        "reward_w_collision": 1.0,
+        "reward_alpha_road": 0.5,
+        "reward_beta_collision": 1.0,
+        "reward_unsafe_penalty": 0.0,
     }
     for k, v in defaults.items():
         if k not in cfg.rl:
@@ -202,6 +210,7 @@ def _validate(
     speed_limit: float,
     max_steps: int,
     distributed: bool,
+    reward_weights: Dict[str, float],
 ) -> float:
     model.eval()
     model_core = _unwrap_model(model)
@@ -225,7 +234,7 @@ def _validate(
                 d_collision,
                 d_road,
                 speed_limit_t,
-                weights={},
+                weights=reward_weights,
             ).sum(dim=-1)
             total_reward += reward.mean().item()
             count += 1
@@ -307,6 +316,17 @@ def main(cfg: DictConfig):
         )
         world_model = PlutoWorldModel(wm_model, idm=idm_cfg)
 
+        reward_weights = {
+            "w_progress": cfg.rl.reward_w_progress,
+            "w_speed": cfg.rl.reward_w_speed,
+            "w_comfort": cfg.rl.reward_w_comfort,
+            "w_margin": cfg.rl.reward_w_margin,
+            "w_collision": cfg.rl.reward_w_collision,
+            "alpha_road": cfg.rl.reward_alpha_road,
+            "beta_collision": cfg.rl.reward_beta_collision,
+            "unsafe_penalty": cfg.rl.reward_unsafe_penalty,
+        }
+
         old_model = copy.deepcopy(_unwrap_model(model)).to(device)
         old_model.eval()
         for p in old_model.parameters():
@@ -354,7 +374,7 @@ def main(cfg: DictConfig):
                         d_collision,
                         d_road,
                         speed_limit_t,
-                        weights={},
+                        weights=reward_weights,
                     )
                     reward = reward_t.sum(dim=-1)
 
@@ -430,6 +450,7 @@ def main(cfg: DictConfig):
                 speed_limit=cfg.rl.speed_limit,
                 max_steps=cfg.rl.val_steps,
                 distributed=distributed,
+                reward_weights=reward_weights,
             )
 
             if is_main:

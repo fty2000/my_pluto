@@ -310,3 +310,20 @@ sh ./script/run_pluto_planner.sh \
 - 降低 `rl.steps_per_epoch`
 - 使用更小场景过滤器先调通
 
+
+
+## 11. Plan-R1 Reward 对齐说明（当前实现）
+
+当前 `src/rl/reward.py` 已按 Plan-R1 的门控形式实现：
+
+- `G_t = I_coll(t) * I_road(t) * I_rule(t)`
+- `S_t = w_prog*c_progress + w_speed*c_speed + w_comfort*c_comfort + w_margin*c_margin + w_coll*c_collision`
+- `R_t = G_t * S_t + (1 - G_t) * unsafe_penalty`
+
+其中默认 `unsafe_penalty=0`，即安全门控失效时本步不再优化软目标。
+
+可通过 `run_rl_training.py` 的 Hydra 参数直接配置：
+
+```bash
+rl.reward_w_progress=1.0 rl.reward_w_speed=0.2 rl.reward_w_comfort=0.05 rl.reward_w_margin=0.3 rl.reward_w_collision=1.0 rl.reward_alpha_road=0.5 rl.reward_beta_collision=1.0 rl.reward_unsafe_penalty=0.0
+```
