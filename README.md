@@ -98,6 +98,58 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 python run_training.py \
 - you can remove wandb related configurations if your prefer tensorboard.
 
 
+
+
+## GDPO residual policy fine-tuning (RL)
+
+This repo now supports GDPO-style RL fine-tuning for the residual XY policy head (enabled in `model.enable_residual_policy=true`).
+
+Detailed Chinese operation manual: `docs/gdpo_manual.md`.
+
+### 1) Prepare a supervised PLUTO checkpoint
+
+Run the normal supervised training first (or use your existing checkpoint), because GDPO stage assumes the planner backbone is already trained.
+
+### 2) Run GDPO training (residual head only)
+
+Example sanity run (tiny scenario set):
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python run_training.py   py_func=train +training=train_pluto_gdpo   scenario_builder=nuplan   cache.cache_path=/nuplan/exp/sanity_check cache.use_cache_without_dataset=true   worker=single_machine_thread_pool worker.max_workers=4   data_loader.params.batch_size=4 data_loader.params.num_workers=1   model.enable_residual_policy=true   custom_trainer.use_gdpo=true   custom_trainer.gdpo_group_size=4   custom_trainer.gdpo_reward_weights=[2.0,2.0,1.0,1.0,1.0]   custom_trainer.gdpo_residual_l2=0.001   custom_trainer.gdpo_freeze_backbone=true   checkpoint=/path/to/pluto_supervised.ckpt
+```
+
+Notes:
+- `gdpo_freeze_backbone=true` freezes all parameters except `model.residual_head`.
+- `gdpo_group_size` controls how many sampled residual rollouts are used per batch item.
+- reward terms used now: collision, offroad, speed-limit, comfort(jerk), progress.
+
+### 3) Optional full-run command
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 python run_training.py   py_func=train +training=train_pluto_gdpo   scenario_builder=nuplan   cache.cache_path=/nuplan/exp/cache_pluto_1M cache.use_cache_without_dataset=true   worker=single_machine_thread_pool worker.max_workers=32   data_loader.params.batch_size=32 data_loader.params.num_workers=16   lr=1e-4 epochs=10 warmup_epochs=1 weight_decay=1e-4   model.enable_residual_policy=true   custom_trainer.use_gdpo=true   custom_trainer.gdpo_group_size=4   custom_trainer.gdpo_reward_weights=[2.0,2.0,1.0,1.0,1.0]   custom_trainer.gdpo_residual_l2=0.001   custom_trainer.gdpo_freeze_backbone=true   checkpoint=/path/to/pluto_supervised.ckpt
+```
+
+### 4) Evaluate by simulation
+
+Use your RL-finetuned checkpoint with the existing planner simulation script:
+
+```bash
+sh ./script/run_pluto_planner.sh   pluto_planner nuplan_mini mini_demo_scenario   <your_gdpo_checkpoint.ckpt>   /dir_to_save_the_simulation_result_video
+```
+
+### 5) Key logs to monitor
+
+In trainer logs, monitor these GDPO metrics:
+- `objectives/train_gdpo_loss`
+- `objectives/train_reward_collision`
+- `objectives/train_reward_offroad`
+- `objectives/train_reward_speed`
+- `objectives/train_reward_comfort`
+- `objectives/train_reward_progress`
+- `objectives/train_residual_l2`
+
+If rewards are unstable, first reduce `lr` and/or `gdpo_group_size`, then tune reward weights.
+
 ## Checkpoint
 
 Download and place the checkpoint in the `pluto/checkpoints` folder.

@@ -17,6 +17,12 @@ state_dropout: 0.75
 use_ego_history: false
 state_attn_encoder: true
 use_hidden_proj: false
+enable_residual_policy: false
+residual_key_idx: [19, 39, 59, 79]
+residual_dt: 0.1
+residual_dx_max: 0.5
+residual_dy_max: 0.5
+residual_v_max: 30.0
 
 feature_builder:
   _target_: src.feature_builders.pluto_feature_builder.PlutoFeatureBuilder

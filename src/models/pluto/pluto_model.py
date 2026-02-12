@@ -19,6 +19,12 @@ from .modules.map_encoder import MapEncoder
 from .modules.static_objects_encoder import StaticObjectsEncoder
 from .modules.planning_decoder import PlanningDecoder
 from .layers.mlp_layer import MLPLayer
+from .modules.residual_policy import (
+    ResidualHead,
+    decode_residual_xy,
+    project_to_feasible,
+    sample_action,
+)
 
 # no meaning, required by nuplan
 trajectory_sampling = TrajectorySampling(num_poses=8, time_horizon=8, interval_length=1)
@@ -45,6 +51,12 @@ class PlanningModel(TorchModuleWrapper):
         use_hidden_proj=False,
         cat_x=False,
         ref_free_traj=False,
+        enable_residual_policy=False,
+        residual_key_idx=None,
+        residual_dt=0.1,
+        residual_dx_max=0.5,
+        residual_dy_max=0.5,
+        residual_v_max=30.0,
         feature_builder: PlutoFeatureBuilder = PlutoFeatureBuilder(),
     ) -> None:
         super().__init__(
@@ -60,6 +72,20 @@ class PlanningModel(TorchModuleWrapper):
         self.num_modes = num_modes
         self.radius = feature_builder.radius
         self.ref_free_traj = ref_free_traj
+
+        self.enable_residual_policy = enable_residual_policy
+        if residual_key_idx is None:
+            residual_key_idx = [
+                max(0, future_steps // 4 - 1),
+                max(0, future_steps // 2 - 1),
+                max(0, (future_steps * 3) // 4 - 1),
+                future_steps - 1,
+            ]
+        self.residual_key_idx = residual_key_idx
+        self.residual_dt = residual_dt
+        self.residual_dx_max = residual_dx_max
+        self.residual_dy_max = residual_dy_max
+        self.residual_v_max = residual_v_max
 
         self.pos_emb = FourierEmbedding(3, dim, 64)
 
@@ -107,6 +133,9 @@ class PlanningModel(TorchModuleWrapper):
 
         if self.ref_free_traj:
             self.ref_free_decoder = MLPLayer(dim, 2 * dim, future_steps * 4)
+
+        if self.enable_residual_policy:
+            self.residual_head = ResidualHead(dim, len(self.residual_key_idx))
 
         self.apply(self._init_weights)
 
@@ -163,17 +192,26 @@ class PlanningModel(TorchModuleWrapper):
         ref_line_available = data["reference_line"]["position"].shape[1] > 0
 
         if ref_line_available:
-            trajectory, probability = self.planning_decoder(
-                data, {"enc_emb": x, "enc_key_padding_mask": key_padding_mask}
-            )
+            if self.enable_residual_policy:
+                trajectory, probability, decoder_queries = self.planning_decoder(
+                    data, {"enc_emb": x, "enc_key_padding_mask": key_padding_mask}, return_queries=True
+                )
+            else:
+                trajectory, probability = self.planning_decoder(
+                    data, {"enc_emb": x, "enc_key_padding_mask": key_padding_mask}
+                )
+                decoder_queries = None
         else:
-            trajectory, probability = None, None
+            trajectory, probability, decoder_queries = None, None, None
 
         out = {
             "trajectory": trajectory,
             "probability": probability,  # (bs, R, M)
             "prediction": prediction,  # (bs, A-1, T, 2)
+            "enc_emb": x,
         }
+        if decoder_queries is not None:
+            out["decoder_queries"] = decoder_queries
 
         if self.use_hidden_proj:
             out["hidden"] = self.hidden_proj(x[:, 0])
@@ -183,6 +221,52 @@ class PlanningModel(TorchModuleWrapper):
                 bs, self.future_steps, 4
             )
             out["ref_free_trajectory"] = ref_free_traj
+
+        residual_taus = None
+        residual_actions = None
+        residual_log_probs = None
+        if self.enable_residual_policy and trajectory is not None:
+            bs, r_num, m_num, t_steps, _ = trajectory.shape
+            probs_flat = probability.reshape(bs, -1)
+            best_idx = probs_flat.softmax(dim=-1).argmax(dim=-1)
+
+            traj_flat = trajectory.reshape(bs, -1, t_steps, 6)
+            query_flat = decoder_queries.reshape(bs, -1, self.dim)
+            residual_taus = []
+            residual_actions = []
+            residual_log_probs = []
+            sample_residual = bool(data.get("sample_residual", False))
+
+            for b in range(bs):
+                tau_base = traj_flat[b, best_idx[b]]
+                q_sel = query_flat[b, best_idx[b]]
+                eenc = x[b]
+                e_av = x[b, 0:1]
+
+                mu, log_std = self.residual_head(q_sel, eenc, e_av)
+                if sample_residual:
+                    action, log_prob = sample_action(mu, log_std)
+                else:
+                    action, log_prob = mu, None
+
+                delta = decode_residual_xy(
+                    action,
+                    tau_base,
+                    key_idx=self.residual_key_idx,
+                    dt=self.residual_dt,
+                    dx_max=self.residual_dx_max,
+                    dy_max=self.residual_dy_max,
+                )
+                tau_final = project_to_feasible(tau_base + delta, v_max=self.residual_v_max)
+                residual_taus.append(tau_final)
+                residual_actions.append(action)
+                if log_prob is not None:
+                    residual_log_probs.append(log_prob)
+
+            out["residual_tau_final"] = torch.stack(residual_taus, dim=0)
+            out["residual_actions"] = torch.stack(residual_actions, dim=0)
+            if len(residual_log_probs) > 0:
+                out["residual_log_prob"] = torch.stack(residual_log_probs, dim=0)
 
         if not self.training:
             if self.ref_free_traj:
@@ -220,7 +304,14 @@ class PlanningModel(TorchModuleWrapper):
                     torch.arange(bs), flattened_probability.argmax(-1)
                 ]
 
-                out["output_trajectory"] = best_trajectory
+                if residual_taus is not None:
+                    residual_xy = out["residual_tau_final"][..., :2]
+                    residual_angle = torch.atan2(
+                        out["residual_tau_final"][..., 3], out["residual_tau_final"][..., 2]
+                    ).unsqueeze(-1)
+                    out["output_trajectory"] = torch.cat([residual_xy, residual_angle], dim=-1)
+                else:
+                    out["output_trajectory"] = best_trajectory
                 out["candidate_trajectories"] = out_trajectory
             else:
                 out["output_trajectory"] = out["output_ref_free_trajectory"]

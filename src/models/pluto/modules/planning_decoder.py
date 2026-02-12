@@ -132,7 +132,7 @@ class PlanningDecoder(nn.Module):
         nn.init.normal_(self.m_emb, mean=0.0, std=0.01)
         nn.init.normal_(self.m_pos, mean=0.0, std=0.01)
 
-    def forward(self, data, enc_data):
+    def forward(self, data, enc_data, return_queries: bool = False):
         enc_emb = enc_data["enc_emb"]
         enc_key_padding_mask = enc_data["enc_key_padding_mask"]
 
@@ -185,4 +185,6 @@ class PlanningDecoder(nn.Module):
 
         traj = torch.cat([loc, yaw, vel], dim=-1)
 
+        if return_queries:
+            return traj, pi, q
         return traj, pi
