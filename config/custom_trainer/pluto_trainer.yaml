@@ -1,1 +1,15 @@
 _target_: src.models.pluto.pluto_trainer.LightningTrainer
+
+# Supervised learning defaults
+use_collision_loss: true
+use_contrast_loss: false
+regulate_yaw: false
+
+# RL fine-tuning (GDPO-style) options
+use_gdpo: false
+gdpo_group_size: 4
+gdpo_reward_weights: [2.0, 2.0, 1.0, 1.0, 1.0]
+gdpo_residual_l2: 0.001
+gdpo_freeze_backbone: true
+gdpo_speed_limit: 15.0
+gdpo_collision_distance: 2.0

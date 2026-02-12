@@ -1,0 +1,14 @@
+# @package _global_
+job_name: pluto_gdpo
+py_func: train
+objective_aggregate_mode: mean
+
+# GDPO-style residual policy fine-tuning
+# Use with a pretrained PLUTO checkpoint and cached features.
+defaults:
+  - override /data_augmentation: contrastive_scenario_generator
+  - override /splitter: nuplan
+  - override /model: pluto_model
+  - override /scenario_filter: training_scenarios_tiny
+  - override /custom_trainer: pluto_trainer
+  - override /lightning: custom_lightning

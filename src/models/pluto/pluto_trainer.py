@@ -1,6 +1,6 @@
 import logging
 import os
-from typing import Dict, Tuple, Union
+from typing import Dict, List, Tuple, Union
 
 import pytorch_lightning as pl
 import torch
@@ -36,6 +36,13 @@ class LightningTrainer(pl.LightningModule):
         use_collision_loss=True,
         use_contrast_loss=False,
         regulate_yaw=False,
+        use_gdpo=False,
+        gdpo_group_size=4,
+        gdpo_reward_weights: List[float] = [2.0, 2.0, 1.0, 1.0, 1.0],
+        gdpo_residual_l2=1e-3,
+        gdpo_freeze_backbone=True,
+        gdpo_speed_limit=15.0,
+        gdpo_collision_distance=2.0,
         objective_aggregate_mode: str = "mean",
     ) -> None:
         """
@@ -63,6 +70,13 @@ class LightningTrainer(pl.LightningModule):
         self.use_collision_loss = use_collision_loss
         self.use_contrast_loss = use_contrast_loss
         self.regulate_yaw = regulate_yaw
+        self.use_gdpo = use_gdpo
+        self.gdpo_group_size = gdpo_group_size
+        self.gdpo_reward_weights = gdpo_reward_weights
+        self.gdpo_residual_l2 = gdpo_residual_l2
+        self.gdpo_freeze_backbone = gdpo_freeze_backbone
+        self.gdpo_speed_limit = gdpo_speed_limit
+        self.gdpo_collision_distance = gdpo_collision_distance
 
         self.radius = model.radius
         self.num_modes = model.num_modes
@@ -71,7 +85,20 @@ class LightningTrainer(pl.LightningModule):
         if use_collision_loss:
             self.collision_loss = ESDFCollisionLoss()
 
+        if self.use_gdpo:
+            assert len(self.gdpo_reward_weights) == 5, (
+                "gdpo_reward_weights should have 5 items: "
+                "[collision, offroad, speed_limit, comfort, progress]"
+            )
+
     def on_fit_start(self) -> None:
+        if self.use_gdpo and self.gdpo_freeze_backbone:
+            for name, param in self.model.named_parameters():
+                if "residual_head" in name:
+                    param.requires_grad = True
+                else:
+                    param.requires_grad = False
+
         metrics_collection = MetricCollection(
             [
                 minADE().to(self.device),
@@ -99,6 +126,12 @@ class LightningTrainer(pl.LightningModule):
         :return: model's scalar loss
         """
         features, targets, scenarios = batch
+
+        if self.use_gdpo and prefix == "train":
+            loss, objectives = self._gdpo_step(features["feature"].data)
+            self._log_step(loss, objectives, None, prefix)
+            return loss
+
         res = self.forward(features["feature"].data)
 
         losses = self._compute_objectives(res, features["feature"].data)
@@ -106,6 +139,130 @@ class LightningTrainer(pl.LightningModule):
         self._log_step(losses["loss"], losses, metrics, prefix)
 
         return losses["loss"] if self.training else 0.0
+
+    def _gdpo_step(self, data) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        if not getattr(self.model, "enable_residual_policy", False):
+            raise RuntimeError(
+                "GDPO requires model.enable_residual_policy=true in model config"
+            )
+
+        group_logp = []
+        group_rewards = []
+        group_actions = []
+
+        for _ in range(self.gdpo_group_size):
+            sampled_data = dict(data)
+            sampled_data["sample_residual"] = True
+            res = self.forward(sampled_data)
+
+            if "residual_log_prob" not in res:
+                raise RuntimeError(
+                    "Residual policy did not return residual_log_prob. "
+                    "Check sample_residual path."
+                )
+
+            tau = res["residual_tau_final"]
+            rewards = self._compute_gdpo_rewards(tau, data)
+            group_logp.append(res["residual_log_prob"])
+            group_rewards.append(rewards)
+            group_actions.append(res["residual_actions"])
+
+        logp = torch.stack(group_logp, dim=1)
+        rewards = torch.stack(group_rewards, dim=1)
+        actions = torch.stack(group_actions, dim=1)
+
+        weight = torch.tensor(
+            self.gdpo_reward_weights, device=logp.device, dtype=logp.dtype
+        )
+        rl_loss, advantage = self._gdpo_loss(logp, rewards, weight)
+        residual_l2 = (actions**2).mean()
+        loss = rl_loss + self.gdpo_residual_l2 * residual_l2
+
+        return loss, {
+            "loss": loss,
+            "gdpo_loss": rl_loss.detach(),
+            "residual_l2": residual_l2.detach(),
+            "reward_mean": rewards.mean().detach(),
+            "adv_mean": advantage.mean().detach(),
+            "adv_std": advantage.std().detach(),
+            "reward_collision": rewards[..., 0].mean().detach(),
+            "reward_offroad": rewards[..., 1].mean().detach(),
+            "reward_speed": rewards[..., 2].mean().detach(),
+            "reward_comfort": rewards[..., 3].mean().detach(),
+            "reward_progress": rewards[..., 4].mean().detach(),
+        }
+
+    def _compute_gdpo_rewards(self, tau: torch.Tensor, data) -> torch.Tensor:
+        """Reward shape: (bs, 5)."""
+        bs, t_steps, _ = tau.shape
+        ego_xy = tau[..., :2]
+        speed = tau[..., 4:6].norm(dim=-1)
+        dt = getattr(self.model, "residual_dt", 0.1)
+
+        other_target = data["agent"]["target"][:bs, 1:, :t_steps, :2]
+        other_valid = data["agent"]["valid_mask"][:bs, 1:, -t_steps:]
+        dist = torch.norm(ego_xy[:, None] - other_target, dim=-1)
+        dist = dist.masked_fill(~other_valid, 1e6)
+        min_dist = dist.amin(dim=(1, 2))
+        r_collision = torch.where(
+            min_dist < self.gdpo_collision_distance,
+            min_dist.new_full(min_dist.shape, -1.0),
+            min_dist.new_zeros(min_dist.shape),
+        )
+
+        ego_norm = ego_xy.norm(dim=-1).amax(dim=-1)
+        r_offroad = torch.where(
+            ego_norm > self.radius,
+            ego_norm.new_full(ego_norm.shape, -1.0),
+            ego_norm.new_zeros(ego_norm.shape),
+        )
+
+        overspeed = (speed - self.gdpo_speed_limit).clamp(min=0.0)
+        r_speed = -torch.clamp(overspeed.mean(dim=-1) / self.gdpo_speed_limit, max=1.0)
+
+        acc = (tau[:, 1:, 4:6] - tau[:, :-1, 4:6]) / dt
+        jerk = (acc[:, 1:] - acc[:, :-1]) / dt
+        jerk_norm = jerk.norm(dim=-1)
+        r_comfort = -torch.clamp(jerk_norm.mean(dim=-1) / 5.0, max=1.0)
+
+        gt_ego = data["agent"]["target"][:bs, 0, :t_steps, :2]
+        gt_disp = gt_ego[:, -1] - gt_ego[:, 0]
+        gt_norm = gt_disp.norm(dim=-1, keepdim=True).clamp(min=1e-3)
+        gt_dir = gt_disp / gt_norm
+        ego_disp = ego_xy[:, -1] - ego_xy[:, 0]
+        proj = (ego_disp * gt_dir).sum(dim=-1)
+        gt_len = gt_norm.squeeze(-1)
+        r_progress = torch.clamp(proj / (gt_len + 1e-6), min=0.0, max=1.0)
+
+        unsafe = (r_collision < 0) | (r_offroad < 0)
+        r_comfort = torch.where(unsafe, r_comfort.new_zeros(r_comfort.shape), r_comfort)
+        r_progress = torch.where(
+            unsafe, r_progress.new_zeros(r_progress.shape), r_progress
+        )
+
+        return torch.stack(
+            [r_collision, r_offroad, r_speed, r_comfort, r_progress], dim=-1
+        )
+
+    def _gdpo_loss(
+        self, logp: torch.Tensor, rewards: torch.Tensor, w: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        logp: (B,G)
+        rewards: (B,G,M)
+        w: (M,)
+        """
+        r_mean = rewards.mean(dim=1, keepdim=True)
+        r_std = rewards.std(dim=1, keepdim=True) + 1e-6
+        a_m = (rewards - r_mean) / r_std
+        a_sum = (a_m * w.view(1, 1, -1)).sum(dim=-1)
+
+        a_mean = a_sum.mean()
+        a_std = a_sum.std() + 1e-6
+        a_hat = (a_sum - a_mean) / a_std
+
+        loss = -(a_hat.detach() * logp).mean()
+        return loss, a_hat
 
     def _compute_objectives(self, res, data) -> Dict[str, torch.Tensor]:
         bs, _, T, _ = res["prediction"].shape
